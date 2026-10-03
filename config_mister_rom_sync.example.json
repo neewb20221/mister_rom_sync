@@ -1,0 +1,16 @@
+{
+  "source_path": "",
+  "destination_path": "",
+  "dat_path": "",
+  "methods": ["dat", "extension", "magic"],
+  "method_order": ["dat", "extension", "magic"],
+  "source_recursive": true,
+  "dest_recursive": true,
+  "dat_recursive": true,
+  "dry_run": true,
+  "unknown_mode": "copy_to_unknown",
+  "skip_bios": true,
+  "primary_only": true,
+  "relocate_on_mister": true,
+  "prune_empty_dirs": true
+}

@@ -1,0 +1,11 @@
+MiSTer DAT folder (all .dat/.xml + manifests live here)
+
+Organize (paths):
+  https://github.com/MiSTerOrganize/MiSTer_Organize/tree/main/DatRoot
+  Organize last check: 2026-10-03T14:57:15Z
+
+No-Intro / Redump (flat, libretro-database):
+  https://github.com/libretro/libretro-database
+  Flat last check: 2026-10-03T14:57:15Z
+
+Prefs: dat_sources.json | Manifests: manifest.json, manifest_extra.json

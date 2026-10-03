@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# Local / runtime state (do not publish)
+logs/
+*.log
+crc_cache.json
+crc_cache.json.tmp
+config_mister_rom_sync.json
+config_organize_ui.json
+config_organize.yaml
+
+# Downloaded DAT catalogues (fetch via UI / dat_download)
+dats/*.dat
+dats/*.xml
+dats/manifest.json
+dats/manifest_extra.json
+
+# Build artifacts
+build/
+dist/
+*.exe
+*.spec
+*.spec.bak
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~

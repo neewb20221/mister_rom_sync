@@ -1,0 +1,5 @@
+MiSTer-kun cropped from official logo_small.png (MkDocs_MiSTer).
+https://raw.githubusercontent.com/MiSTer-devel/MkDocs_MiSTer/main/docs/assets/logo_small.png
+Art: hewhoisred (MiSTer-kun) / Conrad Fenech (logo).
+App icons: fringe cleanup + ~16% padding on a dark circular badge.
+Regen: py -3 _gen_official_icons.py
