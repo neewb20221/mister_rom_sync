@@ -16,8 +16,6 @@ Put the exe in any folder. On first run it creates next to itself: `dats\`, `log
 
 ## How to use
 
-<img width="660" alt="How to use" src="https://github.com/user-attachments/assets/cee8d87d-0383-414e-be1f-d0e8c12153f4" />
-
 1. Run **MiSTerRomSync.exe**.
 2. Set **Source** (your ROM dump) and **Output** (MiSTer `games`, e.g. `\\MISTER\sdcard\games`).
 3. Click **Update all DATs** (or open **DAT files…**) so the built-in catalogue can download.
