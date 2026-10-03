@@ -26,13 +26,15 @@ DAT files are not shipped inside the exe; they are downloaded from the default o
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 
+<p>
+  <a href="https://donatepay.ru/don/neewb20221">
+    <img src="assets/donate_qr.png" alt="Donate QR" width="120">
+  </a>
+</p>
+
 ## Support
 
-If the tool helps you, donations are welcome:
-
-- [DonatePay](https://donatepay.ru/don/neewb20221)
-
-![Donate QR](assets/donate_qr.png)
+If the tool helps you: [DonatePay](https://donatepay.ru/don/neewb20221)
 
 ## Acknowledgments
 
