@@ -1,4 +1,4 @@
-# MiSTer ROM Sync
+<img width="1101" height="1153" alt="image" src="https://github.com/user-attachments/assets/407af2bb-3110-4e65-9650-4dda2683f59a" /># MiSTer ROM Sync
 
 Windows app to identify ROMs (DAT CRC / extension / headers), plan paths for MiSTer `games/`, and copy files to your MiSTer library.
 
@@ -13,6 +13,8 @@ Put the exe in any folder. On first run it creates next to itself: `dats\`, `log
 > Source code in this repository is for development. End users only need the exe from Releases.
 
 ## How to use
+
+<img width="661" height="692" alt="image" src="https://github.com/user-attachments/assets/cee8d87d-0383-414e-be1f-d0e8c12153f4" />
 
 1. Run **MiSTerRomSync.exe**.
 2. Set **Source** (your ROM dump) and **Output** (MiSTer `games`, e.g. `\\MISTER\sdcard\games`).
