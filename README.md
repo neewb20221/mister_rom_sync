@@ -1,4 +1,6 @@
-<img width="1101" height="1153" alt="image" src="https://github.com/user-attachments/assets/407af2bb-3110-4e65-9650-4dda2683f59a" /># MiSTer ROM Sync
+# MiSTer ROM Sync
+
+<img width="900" alt="MiSTer ROM Sync" src="https://github.com/user-attachments/assets/407af2bb-3110-4e65-9650-4dda2683f59a" />
 
 Windows app to identify ROMs (DAT CRC / extension / headers), plan paths for MiSTer `games/`, and copy files to your MiSTer library.
 
@@ -14,7 +16,7 @@ Put the exe in any folder. On first run it creates next to itself: `dats\`, `log
 
 ## How to use
 
-<img width="661" height="692" alt="image" src="https://github.com/user-attachments/assets/cee8d87d-0383-414e-be1f-d0e8c12153f4" />
+<img width="660" alt="How to use" src="https://github.com/user-attachments/assets/cee8d87d-0383-414e-be1f-d0e8c12153f4" />
 
 1. Run **MiSTerRomSync.exe**.
 2. Set **Source** (your ROM dump) and **Output** (MiSTer `games`, e.g. `\\MISTER\sdcard\games`).
@@ -26,15 +28,13 @@ DAT files are not shipped inside the exe; they are downloaded from the default o
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 
-<p>
-  <a href="https://donatepay.ru/don/neewb20221">
-    <img src="assets/donate_qr.png" alt="Donate QR" width="120">
-  </a>
-</p>
-
 ## Support
 
-If the tool helps you: [DonatePay](https://donatepay.ru/don/neewb20221)
+If the tool helps you, donations are welcome:
+
+- [DonatePay](https://donatepay.ru/don/neewb20221)
+
+<img src="assets/donate_qr.png" alt="Donate QR" width="120">
 
 ## Acknowledgments
 
