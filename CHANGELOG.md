@@ -4,16 +4,11 @@ All notable changes are documented here. Release downloads: [GitHub Releases](ht
 
 ## [0.2.0] - 2026-10-09
 
-Scan, CRC, and UI improvements for large MiSTer libraries over Samba.
-
-- Dual progress bars: Current (files/CRC) and Overall (phase)
-- CRC for all files; hybrid workers — full pool for small files, serial CRC for large (>=32 MB)
-- SMB stall detect / CancelIoEx; live Current progress while hashing
-- Primary MiSTer folder from official docs (MegaDrive over Genesis, TGFX16, NES over LightGun/2P, …)
-- Output match: list entire Output, cheap size/name filter, CRC only hits (finds Genesis copies under games/)
-- Source=Output reuses listing/CRCs where possible
-- Actions panel beside Options; tighter Methods/Options layout
-- DAT identify: CRC-first (SHA-1 only on miss for smaller files)
+- Dual progress bars: current operation and overall scan/transfer
+- Faster / safer identify: CRC-first matching, parallel workers, serial hashing for large files
+- Primary MiSTer folder chosen from official core paths (e.g. MegaDrive over Genesis)
+- Output matching lists the full library with cheap size/name filters, then CRC only for hits
+- UI: Actions beside Options; tighter Methods/Options layout
 
 ## [0.1.0] - 2026-10-03
 

@@ -16,11 +16,17 @@ config_mister_rom_sync.json
 config_organize_ui.json
 config_organize.yaml
 
-# Downloaded DAT catalogues (fetch via UI / dat_download)
+# Downloaded DAT catalogues + local DAT prefs
 dats/*.dat
 dats/*.xml
 dats/manifest.json
 dats/manifest_extra.json
+dats/dat_sources.json
+dats/SOURCE.txt
+dats/custom_sources.json
+
+# Dev / one-off generators (not part of the app)
+_gen_*.py
 
 # Build artifacts
 build/

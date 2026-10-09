@@ -2,13 +2,9 @@
 
 This folder holds No-Intro / Redump / MiSTer Organize DAT catalogues used for CRC matching.
 
-**DAT binaries are not stored in git** (large, third-party redistributed). Download them from the app:
+**DAT binaries and local prefs are not stored in git.** Download them from the app:
 
-1. Run `run.bat` (or `mister_rom_sync.py`)
-2. Open **DAT Manager**
-3. Fetch / update MiSTer Organize + flat libretro-database sets
+1. Run `MiSTerRomSync.exe` (or `run.bat` / `mister_rom_sync.py`)
+2. Click **Update all DATs** or open **DAT files…**
 
-Tracked here:
-
-- `dat_sources.json` — which DATs are enabled
-- `SOURCE.txt` — upstream links / last-check notes
+The default catalogue list is built into the app (`dat_sources_default.py`).
