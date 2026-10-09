@@ -26,6 +26,7 @@ dats/manifest_extra.json
 build/
 dist/
 *.exe
+*.zip
 *.spec
 *.spec.bak
 

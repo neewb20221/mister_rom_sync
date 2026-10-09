@@ -13,35 +13,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 ProgressCb = Callable[[str, float, str], None]
 
-# Built-in DAT update addresses (baked into source + frozen EXE).
-ORGANIZE_GITHUB_API = (
+GITHUB_API = (
     "https://api.github.com/repos/MiSTerOrganize/MiSTer_Organize/contents/DatRoot"
 )
-# Back-compat alias
-GITHUB_API = ORGANIZE_GITHUB_API
 USER_AGENT = "mister-rom-sync/1.0"
 MANIFEST_NAME = "manifest.json"
-
-DEFAULT_DAT_UPDATE_SOURCES = (
-    {
-        "id": "mister_organize",
-        "label": "MiSTer Organize (path DATs)",
-        "url": "https://github.com/MiSTerOrganize/MiSTer_Organize/tree/main/DatRoot",
-        "api": ORGANIZE_GITHUB_API,
-    },
-    {
-        "id": "libretro_no_intro",
-        "label": "No-Intro (libretro-database)",
-        "url": "https://github.com/libretro/libretro-database",
-        "api_path": "metadat/no-intro",
-    },
-    {
-        "id": "libretro_redump",
-        "label": "Redump (libretro-database)",
-        "url": "https://github.com/libretro/libretro-database",
-        "api_path": "metadat/redump",
-    },
-)
 
 # MiSTer_Console (20260807).dat  →  set=MiSTer_Console, date=20260807
 _DAT_NAME_RE = re.compile(
@@ -52,47 +28,6 @@ _DAT_NAME_RE = re.compile(
 
 def default_dats_dir(root: Path) -> Path:
     return root / "dats"
-
-
-def ensure_default_dat_layout(dats_dir: Path) -> None:
-    """
-    Create dats/ and seed SOURCE.txt + dat_sources.json from built-in catalogue.
-    Update URLs are hard-coded in this module (DEFAULT_DAT_UPDATE_SOURCES).
-    """
-    from dat_prefs import builtin_default_prefs, load_dat_prefs, save_dat_prefs
-
-    dats_dir.mkdir(parents=True, exist_ok=True)
-    source_txt = dats_dir / "SOURCE.txt"
-    if not source_txt.exists():
-        lines = [
-            "MiSTer ROM Sync — default DAT update sources (built-in)\n",
-            "\n",
-        ]
-        for src in DEFAULT_DAT_UPDATE_SOURCES:
-            lines.append(f"{src['label']}:\n")
-            lines.append(f"  {src['url']}\n")
-        lines.append(
-            "\nPrefs: dat_sources.json | Manifests: manifest.json, manifest_extra.json\n"
-        )
-        source_txt.write_text("".join(lines), encoding="utf-8")
-
-    prefs_file = dats_dir / "dat_sources.json"
-    need_seed = not prefs_file.exists()
-    if not need_seed:
-        try:
-            raw = json.loads(prefs_file.read_text(encoding="utf-8")) or {}
-            need_seed = not (isinstance(raw, dict) and raw.get("sources"))
-        except (OSError, json.JSONDecodeError):
-            need_seed = True
-    if need_seed:
-        save_dat_prefs(dats_dir, builtin_default_prefs())
-    else:
-        # Ensure kinds/exists flags are refreshed; keep catalog even if files missing
-        from dat_prefs import merge_prefs_with_folder
-
-        merged = merge_prefs_with_folder(dats_dir, load_dat_prefs(dats_dir))
-        if merged.entries:
-            save_dat_prefs(dats_dir, merged)
 
 
 @dataclass

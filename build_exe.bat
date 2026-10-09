@@ -22,8 +22,6 @@ py -m PyInstaller ^
   --add-data "assets\mister_32.png;assets" ^
   --add-data "assets\mister_48.png;assets" ^
   --add-data "assets\mister_favicon.png;assets" ^
-  --add-data "assets\donate_qr.png;assets" ^
-  --add-data "dats\dat_sources.json;dats" ^
   --paths "." ^
   --hidden-import dat_engine ^
   --hidden-import dat_download ^
@@ -33,7 +31,6 @@ py -m PyInstaller ^
   --hidden-import rom_heuristics ^
   --hidden-import app_paths ^
   --hidden-import crc_cache ^
-  --hidden-import dat_sources_default ^
   mister_rom_sync.py
 
 if errorlevel 1 (

@@ -6,6 +6,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import sys
+import threading
+import time
 import zipfile
 import zlib
 from dataclasses import dataclass, field
@@ -15,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 # Reuse heuristics (stdlib-only module — no PyYAML)
 from dat_prefs import DatPrefs, merge_prefs_with_folder
-from mister_platform_map import platform_to_mister_folder
+from mister_platform_map import mister_core_path_preference, platform_to_mister_folder
 from rom_heuristics import (
     EXT_MAP,
     SKIP_EXT,
@@ -28,6 +31,17 @@ from rom_heuristics import (
 LOG = logging.getLogger("dat_engine")
 
 ProgressCb = Callable[[str, float, str], None]  # stage, 0..1, detail
+
+# SHA-1 only as fallback when CRC misses — skip re-read for huge files (CRC is enough).
+SHA1_FALLBACK_MAX = 64 * 1024 * 1024
+# Abort only if a single chunk read makes zero progress this long (true SMB freeze).
+# Large ISO/CHD over MiSTer Samba is slow but OK — do not treat slowness as skip.
+HASH_STALL_SECONDS = 120.0
+
+
+def is_unc_path(path: Path) -> bool:
+    s = str(path)
+    return s.startswith("\\\\") or s.startswith("//")
 
 
 @dataclass
@@ -525,7 +539,13 @@ def mister_unsupported_note(
 
 def file_hashes(path: Path, want_sha1: bool = True, want_md5: bool = False,
                 progress: Optional[ProgressCb] = None) -> Tuple[str, str, str, int]:
-    """Return (crc32_hex, sha1_hex, md5_hex, size). CRC/SHA1 cached by size+mtime."""
+    """
+    Return (crc32_hex, sha1_hex, md5_hex, size). CRC/SHA1 cached by size+mtime.
+
+    Always computes CRC for every file (including multi‑GB on MiSTer UNC).
+    Progress callbacks report per-file hashing; a true SMB freeze (no data for
+    HASH_STALL_SECONDS) aborts that file only.
+    """
     from crc_cache import get_crc_cache
 
     cache = get_crc_cache()
@@ -536,33 +556,94 @@ def file_hashes(path: Path, want_sha1: bool = True, want_md5: bool = False,
             crc_h, sha1_h, size_h = hit
             return crc_h, sha1_h if want_sha1 else "", "", size_h
 
-    crc = 0
-    sha1 = hashlib.sha1() if want_sha1 else None
-    md5 = hashlib.md5() if want_md5 else None
-    size = 0
     try:
         st = path.stat()
-        total = max(st.st_size, 1)
+        total = max(int(st.st_size), 1)
         mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
     except OSError:
         total = 1
         mtime_ns = 0
-    with path.open("rb") as fh:
+
+    unc = is_unc_path(path)
+    crc = 0
+    sha1 = hashlib.sha1() if want_sha1 else None
+    md5 = hashlib.md5() if want_md5 else None
+    size = 0
+    # 1 MiB chunks; UNC gets progress often enough via time throttle
+    chunk_size = 1024 * 1024
+    stall_limit = HASH_STALL_SECONDS if unc else HASH_STALL_SECONDS * 3
+
+    fh = path.open("rb")
+    stalled = False
+    try:
+        last_progress_at = time.monotonic()
         while True:
-            chunk = fh.read(1024 * 1024)
+            box: Dict[str, object] = {}
+
+            def _read_once() -> None:
+                try:
+                    box["chunk"] = fh.read(chunk_size)
+                except OSError as exc:
+                    box["err"] = exc
+
+            t = threading.Thread(target=_read_once, daemon=True)
+            t.start()
+            t.join(stall_limit)
+            if t.is_alive():
+                stalled = True
+                LOG.warning(
+                    "Hash stalled %ss on %s — abort (SMB/IO). "
+                    "If hangs persist: disconnect \\\\MISTER in Explorer and reconnect.",
+                    int(stall_limit),
+                    path,
+                )
+                if progress:
+                    progress("hash_stall", size / max(total, 1), path.name)
+                _cancel_os_handle(fh)
+                break
+            if "err" in box:
+                raise box["err"]  # type: ignore[misc]
+            chunk = box.get("chunk")
             if not chunk:
                 break
+            assert isinstance(chunk, (bytes, bytearray))
             size += len(chunk)
             crc = zlib.crc32(chunk, crc)
             if sha1:
                 sha1.update(chunk)
             if md5:
                 md5.update(chunk)
-            if progress and size % (8 * 1024 * 1024) < len(chunk):
+            now = time.monotonic()
+            if progress and (
+                size == len(chunk)
+                or size >= total
+                or now - last_progress_at >= 0.2
+                or size % (4 * 1024 * 1024) < len(chunk)
+            ):
+                last_progress_at = now
                 progress("hash", size / total, path.name)
+    finally:
+        # close() can also block on a dead SMB session — never wait forever
+        def _close() -> None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+        ct = threading.Thread(target=_close, daemon=True)
+        ct.start()
+        ct.join(5.0)
+
+    if stalled or not size:
+        # Do not cache partial / aborted hashes
+        if stalled:
+            return "", "", "", total
+        # empty file
+        pass
+
     crc_hex = f"{crc & 0xFFFFFFFF:08x}"
     sha1_hex = sha1.hexdigest() if sha1 else ""
-    if not want_md5:
+    if not want_md5 and crc_hex and not stalled:
         cache.put(path, crc_hex, size, sha1=sha1_hex, mtime_ns=int(mtime_ns))
     return (
         crc_hex,
@@ -570,6 +651,23 @@ def file_hashes(path: Path, want_sha1: bool = True, want_md5: bool = False,
         md5.hexdigest() if md5 else "",
         size,
     )
+
+
+def _cancel_os_handle(fh: object) -> None:
+    """Best-effort CancelIoEx so a wedged SMB read can unblock close()."""
+    if sys.platform != "win32":
+        return
+    try:
+        import msvcrt
+        import ctypes
+
+        fileno = getattr(fh, "fileno", None)
+        if not callable(fileno):
+            return
+        handle = msvcrt.get_osfhandle(int(fileno()))
+        ctypes.windll.kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _rom_score(
@@ -625,6 +723,10 @@ def _rom_score(
         s -= 40
     if hint_ext in {".gb", ""} and core_u == "GAMEBOY":
         s += 20
+
+    # Official MiSTer /games/ folder beats Organize aliases on CRC ties
+    # (MegaDrive > Genesis, TGFX16 > TurboExpress, NES > NES_LightGun, …)
+    s += mister_core_path_preference(core)
 
     s += min(rel.count("/"), 6) * 3
     s += min(len(base), 96) // 8
@@ -807,15 +909,30 @@ def _lookup_dat_roms(
 
 
 def identify_by_dat(path: Path, index: DatIndex, progress: Optional[ProgressCb] = None) -> Optional[IdentifyResult]:
-    crc, sha1, md5, size = file_hashes(path, want_sha1=True, want_md5=False, progress=progress)
-    hint = path.name
+    """
+    Match a loose file against DAT indexes by CRC-32 (always).
 
-    roms, how, tier = _lookup_dat_roms(index, crc=crc, sha1=sha1, size=size, hint_name=hint)
+    SHA-1 only if CRC misses and the file is not huge (avoids a second full
+    multi‑GB read over SMB when CRC already ran).
+    """
+    hint = path.name
+    crc, _sha1, _md5, size = file_hashes(
+        path, want_sha1=False, want_md5=False, progress=progress
+    )
+    if not crc:
+        return None
+    roms, how, tier = _lookup_dat_roms(
+        index, crc=crc, size=size, hint_name=hint
+    )
+    if not roms and size <= SHA1_FALLBACK_MAX:
+        _crc2, sha1, _md5, size = file_hashes(
+            path, want_sha1=True, want_md5=False, progress=progress
+        )
+        if sha1:
+            roms, how, tier = _lookup_dat_roms(
+                index, sha1=sha1, size=size, hint_name=hint
+            )
     if not roms:
-        if path.suffix.casefold() == ".zip":
-            inner = identify_zip_members_dat(path, index)
-            if inner:
-                return inner
         return None
     return _dat_result_from_roms(roms, how, tier=tier, hint_name=hint)
 

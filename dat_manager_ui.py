@@ -13,7 +13,6 @@ from dat_download import (
     add_custom_source,
     download_all_dats,
     download_custom_sources,
-    ensure_default_dat_layout,
     update_source_label,
 )
 from dat_prefs import (
@@ -45,9 +44,7 @@ class DatManagerDialog(tk.Toplevel):
         self._dat_dir = Path(dat_dir)
         self._recursive = bool(recursive)
         self._on_saved = on_saved
-        ensure_default_dat_layout(self._dat_dir)
         self._prefs = merge_prefs_with_folder(self._dat_dir, recursive=self._recursive)
-        save_dat_prefs(self._dat_dir, self._prefs)
         self._busy = False
 
         self._build()
@@ -153,12 +150,8 @@ class DatManagerDialog(tk.Toplevel):
                 values=(mark, str(i + 1), kind, e.rel, size, src),
             )
         on = sum(1 for e in self._prefs.entries if e.enabled and e.exists)
-        missing = sum(1 for e in self._prefs.entries if not e.exists)
         self.lbl_status.configure(
-            text=(
-                f"{len(self._prefs.entries)} DAT(s), {on} on disk enabled, "
-                f"{missing} not downloaded — {self._dat_dir}"
-            )
+            text=f"{len(self._prefs.entries)} DAT(s), {on} enabled — {self._dat_dir}"
         )
 
     def _selected_index(self) -> Optional[int]:
