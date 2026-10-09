@@ -1,8 +1,4 @@
 # Optional — only needed to build the standalone EXE:
 pyinstaller>=6.0
 
-# Optional — regenerate assets/*.ico|png from official logo:
-# pillow>=10.0
-
 # Note: mister_rom_sync.py needs only Python stdlib + tkinter.
-# Legacy CLI organize.py uses vendored PyYAML under vendor/.
