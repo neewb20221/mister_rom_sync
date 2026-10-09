@@ -8,32 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from dat_sources_default import DEFAULT_DAT_SOURCES
 
 PREFS_NAME = "dat_sources.json"
-
-
-def kind_from_rel(rel: str) -> str:
-    name = Path(rel).name.casefold()
-    if name.startswith("mister"):
-        return "path"
-    return "flat"
-
-
-def builtin_default_prefs() -> DatPrefs:
-    """Hard-coded catalogue shipped with the app (before first DAT download)."""
-    prefs = DatPrefs()
-    for rel, enabled in DEFAULT_DAT_SOURCES:
-        prefs.entries.append(
-            DatSourceEntry(
-                rel=str(rel).replace("\\", "/"),
-                enabled=bool(enabled),
-                kind=kind_from_rel(str(rel)),
-                size=0,
-                exists=False,
-            )
-        )
-    return prefs
 
 
 @dataclass
@@ -96,20 +72,14 @@ def prefs_path(dat_dir: Path) -> Path:
 def load_dat_prefs(dat_dir: Path) -> DatPrefs:
     path = prefs_path(dat_dir)
     if not path.exists():
-        return builtin_default_prefs()
+        return DatPrefs()
     try:
         raw = json.loads(path.read_text(encoding="utf-8")) or {}
     except (OSError, json.JSONDecodeError):
-        return builtin_default_prefs()
+        return DatPrefs()
     if not isinstance(raw, dict):
-        return builtin_default_prefs()
-    prefs = DatPrefs.from_json(raw)
-    if not prefs.entries:
-        return builtin_default_prefs()
-    for e in prefs.entries:
-        if not e.kind:
-            e.kind = kind_from_rel(e.rel)
-    return prefs
+        return DatPrefs()
+    return DatPrefs.from_json(raw)
 
 
 def save_dat_prefs(dat_dir: Path, prefs: DatPrefs) -> None:
@@ -177,13 +147,12 @@ def merge_prefs_with_folder(
 ) -> DatPrefs:
     """
     Refresh prefs against files on disk.
-    Keeps user order/enabled for catalog entries even if the .dat is not
-    downloaded yet (exists=False). Appends newly found files on disk.
+    Keeps user order/enabled for known files; appends new ones
+    (MiSTer path DATs before flat). Drops missing from the active list
+    but keeps disabled+missing entries pruned.
     """
     dat_dir = dat_dir.resolve()
     old = prefs or load_dat_prefs(dat_dir)
-    if not old.entries:
-        old = builtin_default_prefs()
     old_by_rel = {e.rel.replace("\\", "/").casefold(): e for e in old.entries}
 
     discovered: Dict[str, DatSourceEntry] = {}
@@ -207,26 +176,16 @@ def merge_prefs_with_folder(
             exists=True,
         )
 
+    # Preserve previous order for files that still exist
     ordered: List[DatSourceEntry] = []
     seen: set = set()
     for e in old.entries:
         key = e.rel.replace("\\", "/").casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        if key in discovered:
+        if key in discovered and key not in seen:
             ordered.append(discovered[key])
-        else:
-            ordered.append(
-                DatSourceEntry(
-                    rel=e.rel.replace("\\", "/"),
-                    enabled=e.enabled,
-                    kind=e.kind or kind_from_rel(e.rel),
-                    size=0,
-                    exists=False,
-                )
-            )
+            seen.add(key)
 
+    # New files: path DATs first
     newcomers = [discovered[k] for k in discovered if k not in seen]
     newcomers.sort(key=lambda e: _default_sort_key(e.rel, e.kind))
     ordered.extend(newcomers)

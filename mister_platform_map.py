@@ -247,6 +247,103 @@ def is_mister_core_folder(name: str) -> bool:
     return name.casefold() in {f.casefold() for f in MISTER_CORE_FOLDERS}
 
 
+def mister_core_path_preference(core: str) -> int:
+    """
+    Prefer official MiSTer /games/<folder> when the same CRC appears under
+    several Organize cores (aliases, 2P, lightgun, archived Genesis, …).
+
+    Higher = better primary. See:
+    https://mister-devel.github.io/MkDocs_MiSTer/cores/console/
+    """
+    if not core:
+        return 0
+    c = core.strip()
+    cu = c.upper().replace("-", "_")
+
+    # Archived / duplicate MD folders → MegaDrive is the live core
+    if cu == "MEGADRIVE":
+        return 100
+    if cu == "GENESIS" or cu.startswith("GENESIS_"):
+        return 15
+    if cu.startswith("GENESIS"):
+        return 15
+
+    # PC Engine: docs use TGFX16 (TurboExpress is Organize portable twin)
+    if cu == "TGFX16":
+        return 100
+    if cu == "TURBOEXPRESS":
+        return 15
+
+    # Odyssey² / Videopac — same hardware; docs folder Odyssey2
+    if cu in {"ODYSSEY2", "ODYSSEY"}:
+        return 100
+    if cu == "VIDEOPAC":
+        return 15
+
+    # Alternate input / music / link modes — below the main core
+    if (
+        "LIGHTGUN" in cu
+        or "SINDEN" in cu
+        or cu.endswith("_NSF")
+        or cu.endswith("_SPC")
+        or "TRANSFERPAK" in cu
+        or "ALECK64" in cu
+        or cu.endswith("_VIDEO")
+    ):
+        return 20
+
+    # 2-player / SGB2 twins
+    if cu.endswith("2P") or cu in {"SGB2"}:
+        return 25
+
+    # Documented main console folders (boost so they beat aliases on ties)
+    main = {
+        "NES",
+        "SNES",
+        "SMS",
+        "SGB",
+        "GAMEBOY",
+        "GBC",
+        "GBA",
+        "N64",
+        "PSX",
+        "SATURN",
+        "NEOGEO",
+        "S32X",
+        "MEGACD",
+        "SG1000",
+        "COLECO",
+        "ATARILYNX",
+        "ATARI7800",
+        "ATARI5200",
+        "ATARI2600",
+        "JAGUAR",
+        "WONDERSWAN",
+        "WONDERSWANCOLOR",
+        "POKEMONMINI",
+        "VECTREX",
+        "INTELLIVISION",
+        "ASTROCADE",
+        "CHANNELF",
+        "CREATIVISION",
+        "GAMATE",
+        "AVISION",
+        "FDS",
+        "SATELLAVIEW",
+        "SUFAMITURBO",
+        "MEGADUCK",
+        "GAMEGEAR",
+        "TGFX16_CD",
+        "TGFX16-CD",
+    }
+    # DAT uses TGFX16-CD with hyphen
+    if cu in main or cu.replace("_", "-") in {"TGFX16-CD"}:
+        return 90
+    if c in MISTER_CORE_FOLDERS or is_mister_core_folder(c):
+        return 70
+    return 40
+
+
 # Official docs: CD images and VHD must not stay inside zip; cart ROMs may.
 # https://mister-devel.github.io/MkDocs_MiSTer/setup/games/
 MISTER_CD_CORE_FOLDERS = frozenset(

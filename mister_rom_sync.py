@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import shutil
+import stat as stat_mod
 import subprocess
 import sys
 import threading
@@ -19,23 +20,19 @@ import time
 import traceback
 import webbrowser
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from app_paths import app_dir, bundle_dir
-from dat_download import (
-    default_dats_dir,
-    download_all_dats,
-    ensure_default_dat_layout,
-)
+from dat_download import default_dats_dir, download_all_dats
 from dat_manager_ui import DatManagerDialog
-from dat_prefs import list_dat_files, merge_prefs_with_folder, save_dat_prefs
+from dat_prefs import merge_prefs_with_folder, save_dat_prefs
 from dat_engine import (
     METHOD_ORDER_DEFAULT,
     DatIndex,
@@ -54,10 +51,10 @@ from rom_heuristics import is_bios_like_path
 
 _ROOT = app_dir()
 DEFAULT_DATS = default_dats_dir(_ROOT)
+DEFAULT_GAMES = Path(r"\\MISTER\sdcard\games")
 CONFIG_PATH = _ROOT / "config_mister_rom_sync.json"
-
 APP_NAME = "MiSTer ROM Sync"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 GITHUB_REPO_URL = "https://github.com/neewb20221/mister_rom_sync"
 GITHUB_RELEASES_URL = f"{GITHUB_REPO_URL}/releases"
 DONATE_URL = "https://donatepay.ru/don/neewb20221"
@@ -85,10 +82,9 @@ STATUS_OTHER = "crc elsewhere"
 
 @dataclass
 class Settings:
-    # First launch: empty paths — user fills Source / Output; DAT folder defaults to ./dats
-    source_path: str = ""
-    destination_path: str = ""
-    dat_path: str = ""
+    source_path: str = r"C:\temp\rom_dump"
+    destination_path: str = str(DEFAULT_GAMES)
+    dat_path: str = str(DEFAULT_DATS)
     methods: List[str] = field(default_factory=lambda: list(METHOD_ORDER_DEFAULT))
     # Full identification order (enabled + disabled); methods = enabled subset in priority order
     method_order: List[str] = field(
@@ -231,19 +227,9 @@ def _migrate_legacy_config() -> None:
             return
 
 
-def _resolve_dat_dir(dat_path: str) -> Path:
-    text = (dat_path or "").strip()
-    if not text:
-        return DEFAULT_DATS
-    p = Path(text)
-    if not p.is_absolute():
-        p = _ROOT / p
-    return p
-
-
 def load_settings() -> Settings:
+    DEFAULT_DATS.mkdir(parents=True, exist_ok=True)
     _migrate_legacy_config()
-    ensure_default_dat_layout(DEFAULT_DATS)
     if not CONFIG_PATH.exists():
         return Settings()
     try:
@@ -252,13 +238,12 @@ def load_settings() -> Settings:
     except (OSError, json.JSONDecodeError):
         return Settings()
     s = Settings()
-    s.source_path = str(raw.get("source_path", s.source_path) or "")
-    s.destination_path = str(raw.get("destination_path", s.destination_path) or "")
-    s.dat_path = str(raw.get("dat_path", s.dat_path) or "")
-    if s.dat_path.strip():
-        dp = Path(s.dat_path)
-        if not dp.is_absolute():
-            s.dat_path = str(_ROOT / dp)
+    s.source_path = str(raw.get("source_path", s.source_path))
+    s.destination_path = str(raw.get("destination_path", s.destination_path))
+    s.dat_path = str(raw.get("dat_path", s.dat_path))
+    dp = Path(s.dat_path)
+    if not dp.is_absolute():
+        s.dat_path = str(_ROOT / dp)
     s.methods = [m for m in (raw.get("methods") or METHOD_ORDER_DEFAULT) if m != "zip"]
     if not s.methods:
         s.methods = list(METHOD_ORDER_DEFAULT)
@@ -321,13 +306,83 @@ def format_size(n: int) -> str:
     return f"{n} B"
 
 
+def is_unc_path(path: Path) -> bool:
+    """True for \\\\server\\share paths (MiSTer Samba, etc.)."""
+    s = str(path)
+    return s.startswith("\\\\") or s.startswith("//")
+
+
+# Only one large-file CRC/hash at a time (ISO/CHD); small files keep full parallelism.
+LARGE_FILE_BYTES = 32 * 1024 * 1024  # 32 MiB
+
+
 def worker_count(path: Path, kind: str) -> int:
     """I/O-bound pools; fewer threads for UNC/SMB (MiSTer share)."""
     cpu = os.cpu_count() or 4
-    unc = str(path).startswith("\\\\")
+    unc = is_unc_path(path)
     if kind == "scan":
         return max(4, min(8 if unc else 20, cpu * 2))
     return max(2, min(3 if unc else 8, cpu))
+
+
+def scan_overall(phase: str, frac: float = 0.0) -> float:
+    """
+    Map a scan sub-step into overall 0..1.
+    phase frac is local 0..1 within that step.
+    """
+    spans = {
+        "dat": (0.00, 0.08),
+        "list_src": (0.08, 0.16),
+        "identify": (0.16, 0.62),
+        "src_crc": (0.62, 0.78),
+        "dest": (0.78, 1.00),
+        "done": (1.00, 1.00),
+    }
+    lo, hi = spans.get(phase, (0.0, 1.0))
+    f = max(0.0, min(1.0, float(frac)))
+    return lo + (hi - lo) * f
+
+
+def _norm_path_key(path: Path) -> str:
+    try:
+        s = str(path.resolve())
+    except OSError:
+        s = str(path)
+    return s.replace("/", "\\").casefold()
+
+
+def paths_same_tree(a: Path, b: Path) -> bool:
+    """True when a and b refer to the same directory (Source == Output)."""
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return _norm_path_key(a) == _norm_path_key(b)
+
+
+def source_file_crc_for_dest(item: PlannedItem) -> Tuple[str, int]:
+    """
+    CRC/size of the source *file on disk* (zip payload or loose ROM).
+    Used to seed MiSTer dest matching without re-hashing the same path.
+    """
+    if item.is_archive:
+        return item.crc_packed or "", int(item.packed_bytes or 0)
+    crc = item.crc_unpacked or item.crc_packed or ""
+    size = int(item.unpacked_bytes or item.packed_bytes or 0)
+    return crc, size
+
+
+def build_known_source_crcs(items: List[PlannedItem]) -> Dict[str, Tuple[str, int]]:
+    """Map normalized source path → (crc, size) after the Source CRC phase."""
+    out: Dict[str, Tuple[str, int]] = {}
+    for it in items:
+        crc, size = source_file_crc_for_dest(it)
+        if not crc:
+            continue
+        key = _norm_path_key(it.source)
+        prev = out.get(key)
+        if prev is None or (not prev[0] and crc):
+            out[key] = (crc, size)
+    return out
 
 
 def zip_member_size(path: Path, member: Optional[str]) -> Optional[int]:
@@ -586,6 +641,7 @@ def plan_source(
     *,
     skip_bios: bool = True,
     primary_only: bool = True,
+    progress: Optional[Callable[[str, float, str], None]] = None,
 ) -> List[PlannedItem]:
     """Plan loose file or every supported member inside an archive."""
     if is_archive(source):
@@ -611,7 +667,7 @@ def plan_source(
             )
         return coalesce_cd_set_paths(items)
 
-    result = identify_file(source, methods, index)
+    result = identify_file(source, methods, index, progress=progress)
     return plan_from_identify(
         source,
         result,
@@ -1123,13 +1179,12 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1100x1120")
-        self.minsize(900, 980)
+        self.geometry("1100x960")
+        self.minsize(900, 820)
 
         self.settings = load_settings()
         self._busy = False
         self._paused = False
-        self._pending_scan_after_dat = False
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._queue: queue.Queue = queue.Queue()
@@ -1263,10 +1318,10 @@ class App(tk.Tk):
         header = ttk.Frame(root)
         header.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(header, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(
-            side=tk.LEFT, anchor=tk.W
+            side=tk.LEFT
         )
         ttk.Button(header, text="About", command=self.on_about).pack(
-            side=tk.RIGHT, anchor=tk.E
+            side=tk.RIGHT
         )
 
         paths = ttk.LabelFrame(root, text="Paths", padding=10)
@@ -1304,41 +1359,45 @@ class App(tk.Tk):
         )
         paths.columnconfigure(1, weight=1, minsize=120)
 
-        methods = ttk.LabelFrame(root, text="Identification methods", padding=10)
-        methods.pack(fill=tk.X, **pad)
+        # Methods (narrow) + Options side-by-side → shorter window
+        mid = ttk.Frame(root)
+        mid.pack(fill=tk.X, **pad)
+
+        methods = ttk.LabelFrame(mid, text="Identification methods", padding=8)
+        methods.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
         self.method_vars: Dict[str, tk.BooleanVar] = {
             key: tk.BooleanVar(value=True) for key, _ in METHOD_LABELS
         }
         self._method_order: List[str] = [key for key, _ in METHOD_LABELS]
         meth_mid = ttk.Frame(methods)
-        meth_mid.pack(fill=tk.X)
+        meth_mid.pack(fill=tk.BOTH, expand=True)
         self.method_tree = ttk.Treeview(
             meth_mid,
             columns=("on", "pri", "method"),
             show="headings",
-            height=3,
+            height=5,
             selectmode="browse",
         )
         self.method_tree.heading("on", text="On")
         self.method_tree.heading("pri", text="#")
-        self.method_tree.heading("method", text="Method (top = tried first)")
-        self.method_tree.column("on", width=40, anchor=tk.CENTER, stretch=False)
-        self.method_tree.column("pri", width=36, anchor=tk.CENTER, stretch=False)
-        self.method_tree.column("method", width=360, anchor=tk.W)
+        self.method_tree.heading("method", text="Method")
+        self.method_tree.column("on", width=36, anchor=tk.CENTER, stretch=False)
+        self.method_tree.column("pri", width=28, anchor=tk.CENTER, stretch=False)
+        self.method_tree.column("method", width=168, anchor=tk.W, stretch=True)
         meth_side = ttk.Frame(meth_mid)
-        meth_side.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
-        ttk.Button(meth_side, text="↑ Up", command=lambda: self._move_method(-1)).pack(
+        meth_side.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
+        ttk.Button(meth_side, text="↑", width=3, command=lambda: self._move_method(-1)).pack(
             fill=tk.X, pady=2
         )
-        ttk.Button(meth_side, text="↓ Down", command=lambda: self._move_method(1)).pack(
+        ttk.Button(meth_side, text="↓", width=3, command=lambda: self._move_method(1)).pack(
             fill=tk.X, pady=2
         )
         self.method_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.method_tree.bind("<Button-1>", self._on_method_click)
         self.method_tree.bind("<space>", lambda _e: self._toggle_method())
 
-        opts = ttk.LabelFrame(root, text="Options", padding=10)
-        opts.pack(fill=tk.X, **pad)
+        opts = ttk.LabelFrame(mid, text="Options", padding=8)
+        opts.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.var_dry = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -1354,7 +1413,7 @@ class App(tk.Tk):
             text="Don't mark for transfer BIOS / boot ROMs",
             variable=self.var_skip_bios,
             command=self._on_setting_changed,
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
 
         self.var_primary_only = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -1362,7 +1421,7 @@ class App(tk.Tk):
             text="Primary folder only (no multi-platform duplicates)",
             variable=self.var_primary_only,
             command=self._on_setting_changed,
-        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
 
         self.var_relocate = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -1370,7 +1429,7 @@ class App(tk.Tk):
             text="Relocate same-CRC files already on MiSTer (no re-copy)",
             variable=self.var_relocate,
             command=self._autosave,
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
 
         self.var_prune_empty = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -1378,12 +1437,12 @@ class App(tk.Tk):
             text="Remove empty nested folders under platforms after transfer",
             variable=self.var_prune_empty,
             command=self._autosave,
-        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
 
-        ttk.Label(opts, text="Unknown files:").grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Label(opts, text="Unknown files:").grid(row=5, column=0, sticky=tk.W, pady=(4, 0))
         self.var_unknown = tk.StringVar(value="copy_to_unknown")
         unk = ttk.Frame(opts)
-        unk.grid(row=5, column=1, sticky=tk.W)
+        unk.grid(row=5, column=1, sticky=tk.W, pady=(4, 0))
         ttk.Radiobutton(
             unk,
             text="Copy to _unknown",
@@ -1399,29 +1458,37 @@ class App(tk.Tk):
             command=self._on_setting_changed,
         ).pack(side=tk.LEFT)
 
-        btns = ttk.Frame(root)
-        # Match LabelFrame outer padx so buttons don't stick left of Paths/Options
-        btns.pack(fill=tk.X, padx=10, pady=8)
+        # Actions to the right of Options (vertical stack / 2 columns)
+        actions = ttk.LabelFrame(mid, text="Actions", padding=8)
+        actions.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
         self.btn_dl = ttk.Button(
-            btns, text="1. Update all DATs", command=self.on_download
+            actions, text="1. Update all DATs", command=self.on_download
         )
-        self.btn_dl.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_dl.grid(row=0, column=0, columnspan=2, sticky="ew", pady=2)
         self.btn_scan = ttk.Button(
-            btns, text="2. Scan Source + Output", command=self.on_scan
+            actions, text="2. Scan Source + Output", command=self.on_scan
         )
-        self.btn_scan.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_scan.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
         self.btn_run = ttk.Button(
-            btns, text="3. Run transfer", command=self.on_run, state=tk.DISABLED
+            actions, text="3. Run transfer", command=self.on_run, state=tk.DISABLED
         )
-        self.btn_run.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_pause = ttk.Button(btns, text="Pause", command=self.on_pause, state=tk.DISABLED)
-        self.btn_pause.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_stop = ttk.Button(btns, text="Stop", command=self.on_stop, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="Default settings", command=self.on_defaults).pack(
-            side=tk.LEFT, padx=(0, 8)
+        self.btn_run.grid(row=2, column=0, columnspan=2, sticky="ew", pady=2)
+        self.btn_pause = ttk.Button(
+            actions, text="Pause", command=self.on_pause, state=tk.DISABLED
         )
-        ttk.Button(btns, text="Exit", command=self.destroy).pack(side=tk.RIGHT)
+        self.btn_pause.grid(row=3, column=0, sticky="ew", padx=(0, 4), pady=2)
+        self.btn_stop = ttk.Button(
+            actions, text="Stop", command=self.on_stop, state=tk.DISABLED
+        )
+        self.btn_stop.grid(row=3, column=1, sticky="ew", pady=2)
+        ttk.Button(actions, text="Default settings", command=self.on_defaults).grid(
+            row=4, column=0, sticky="ew", padx=(0, 4), pady=2
+        )
+        ttk.Button(actions, text="Exit", command=self.destroy).grid(
+            row=4, column=1, sticky="ew", pady=2
+        )
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
 
         # Draggable splitters between Scan results / Progress / Log
         self.main_paned = ttk.Panedwindow(root, orient=tk.VERTICAL)
@@ -1528,12 +1595,30 @@ class App(tk.Tk):
 
         prog = ttk.LabelFrame(bottom, text="Progress", padding=10)
         prog.pack(fill=tk.X, pady=(0, 6))
-        self.lbl_stage = ttk.Label(prog, text="Idle")
-        self.lbl_stage.pack(anchor=tk.W)
-        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=100)
-        self.progress.pack(fill=tk.X, pady=4)
-        self.lbl_detail = ttk.Label(prog, text="", foreground="#555")
-        self.lbl_detail.pack(anchor=tk.W)
+        prog.columnconfigure(0, weight=1)
+
+        # Current = this file / sub-step (bytes, name, …)
+        ttk.Label(prog, text="Current", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky=tk.W
+        )
+        self.lbl_current = ttk.Label(prog, text="Idle", foreground="#333")
+        self.lbl_current.grid(row=1, column=0, sticky=tk.W)
+        self.progress_op = ttk.Progressbar(prog, mode="determinate", maximum=100)
+        self.progress_op.grid(row=2, column=0, sticky="ew", pady=(2, 6))
+        # Back-compat alias
+        self.progress = self.progress_op
+        self.lbl_stage = self.lbl_current  # older pause paths
+        self.lbl_detail = self.lbl_current
+
+        # Overall = which scan/transfer phase + total %
+        ttk.Label(prog, text="Overall", font=("Segoe UI", 9, "bold")).grid(
+            row=3, column=0, sticky=tk.W
+        )
+        self.lbl_overall = ttk.Label(prog, text="", foreground="#333")
+        self.lbl_overall.grid(row=4, column=0, sticky=tk.W)
+        self.progress_all = ttk.Progressbar(prog, mode="determinate", maximum=100)
+        self.progress_all.grid(row=5, column=0, sticky="ew", pady=(2, 0))
+        self._progress_indeterminate = False
 
         logf = ttk.LabelFrame(bottom, text="Log", padding=8)
         logf.pack(fill=tk.BOTH, expand=True)
@@ -1924,23 +2009,48 @@ class App(tk.Tk):
         if path:
             self.var_dat.set(self._norm_display_path(path))
 
-    def _list_files(self, root: Path, *, recursive: bool) -> List[Path]:
-        """List files under root; optional subfolders. Skips dotfiles."""
-        out: List[Path] = []
+    def _list_files(
+        self,
+        root: Path,
+        *,
+        recursive: bool,
+        on_progress: Optional[Callable[[int, Path], None]] = None,
+        with_sizes: bool = False,
+    ) -> Union[List[Path], List[Tuple[Path, int]]]:
+        """
+        List files under root; optional subfolders. Skips dotfiles.
+        If with_sizes: return List[Tuple[Path, int]] (size from one stat).
+        """
+        out_paths: List[Path] = []
+        out_sized: List[Tuple[Path, int]] = []
         if not root.exists():
-            return out
+            return out_sized if with_sizes else out_paths
         try:
             iterator = root.rglob("*") if recursive else root.iterdir()
         except OSError:
-            return out
+            return out_sized if with_sizes else out_paths
+        n = 0
         for p in iterator:
             self._check_control()
+            if p.name.startswith("."):
+                continue
             try:
-                if p.is_file() and not p.name.startswith("."):
-                    out.append(p)
+                st = p.stat()
             except OSError:
                 continue
-        return out
+            if not stat_mod.S_ISREG(st.st_mode):
+                continue
+            if with_sizes:
+                out_sized.append((p, int(st.st_size)))
+            else:
+                out_paths.append(p)
+            n += 1
+            if on_progress and (n == 1 or n % 25 == 0):
+                on_progress(n, p)
+        if on_progress and n:
+            last = out_sized[-1][0] if with_sizes else out_paths[-1]
+            on_progress(n, last)
+        return out_sized if with_sizes else out_paths
 
     def _normalize_method_order(self, preferred: List[str]) -> List[str]:
         order: List[str] = []
@@ -2061,7 +2171,7 @@ class App(tk.Tk):
         return Settings(
             source_path=self._norm_display_path(self.var_source.get()),
             destination_path=self._norm_display_path(self.var_dest.get()),
-            dat_path=self._norm_display_path(self.var_dat.get()),
+            dat_path=self._norm_display_path(self.var_dat.get()) or str(DEFAULT_DATS),
             methods=methods,
             method_order=order,
             source_recursive=bool(self.var_source_recursive.get()),
@@ -2079,10 +2189,63 @@ class App(tk.Tk):
         self.log.insert(tk.END, text + "\n")
         self.log.see(tk.END)
 
-    def set_progress(self, stage: str, frac: float, detail: str = "") -> None:
-        self.lbl_stage.configure(text=stage)
-        self.progress["value"] = max(0.0, min(100.0, frac * 100.0))
-        self.lbl_detail.configure(text=detail)
+    def set_progress(
+        self,
+        stage: str,
+        frac: float,
+        detail: str = "",
+        *,
+        overall: Optional[float] = None,
+        indeterminate: bool = False,
+    ) -> None:
+        """
+        Current bar = frac of the current phase unit (files done/total, CRC of file, …).
+        Current label = detail (must match what frac represents).
+        Overall bar/label = phase name (stage) + overall fraction.
+        """
+        cur = max(0.0, min(1.0, float(frac)))
+        # Always determinate for Current — indeterminate hid real % while labels moved
+        if self._progress_indeterminate:
+            self.progress_op.stop()
+            self.progress_op.configure(mode="determinate", maximum=100)
+            self._progress_indeterminate = False
+        if indeterminate and cur <= 0.0:
+            # Unknown total: keep bar at 0, still show live detail text
+            self.progress_op["value"] = 0.0
+            self.lbl_current.configure(text=detail or "…")
+        else:
+            self.progress_op["value"] = cur * 100.0
+            pct = f"{cur * 100.0:.0f}%"
+            text = detail or "…"
+            if text and not text.rstrip().endswith("%"):
+                text = f"{text}  ·  {pct}"
+            self.lbl_current.configure(text=text)
+        if overall is not None:
+            ov = max(0.0, min(1.0, float(overall)))
+            self.progress_all["value"] = ov * 100.0
+            self.lbl_overall.configure(text=f"{stage}  ·  {ov * 100.0:.0f}%")
+        else:
+            self.lbl_overall.configure(text=stage)
+
+    def _emit_progress(
+        self,
+        stage: str,
+        frac: float,
+        detail: str = "",
+        *,
+        overall: Optional[float] = None,
+        indeterminate: bool = False,
+    ) -> None:
+        self._emit(
+            "progress",
+            {
+                "stage": stage,
+                "frac": frac,
+                "detail": detail,
+                "overall": overall,
+                "indeterminate": indeterminate,
+            },
+        )
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -2716,8 +2879,18 @@ class App(tk.Tk):
                 if kind == "log":
                     self.log_line(payload)
                 elif kind == "progress":
-                    stage, frac, detail = payload
-                    self.set_progress(stage, frac, detail)
+                    if isinstance(payload, dict):
+                        self.set_progress(
+                            str(payload.get("stage") or ""),
+                            float(payload.get("frac") or 0.0),
+                            str(payload.get("detail") or ""),
+                            overall=payload.get("overall"),
+                            indeterminate=bool(payload.get("indeterminate")),
+                        )
+                    else:
+                        stage, frac, detail = payload[0], payload[1], payload[2]
+                        overall = payload[3] if len(payload) > 3 else None
+                        self.set_progress(stage, frac, detail, overall=overall)
                 elif kind == "scan_done":
                     self._set_busy(False)
                     folders, by_rel, by_crc = payload
@@ -2752,11 +2925,6 @@ class App(tk.Tk):
                             msg + "\n\nStarting a new scan…",
                         )
                         self.after(50, self.on_scan)
-                    elif title == "DAT update":
-                        messagebox.showinfo(title, msg)
-                        if getattr(self, "_pending_scan_after_dat", False):
-                            self._pending_scan_after_dat = False
-                            self.after(50, self.on_scan)
                     else:
                         messagebox.showinfo(title, msg)
                 elif kind == "error":
@@ -2773,16 +2941,78 @@ class App(tk.Tk):
     def _emit(self, kind: str, payload) -> None:
         self._queue.put((kind, payload))
 
-    def _asset_path(self, name: str) -> Optional[Path]:
-        for base in (
-            bundle_dir() / "assets",
-            _ROOT / "assets",
-            Path(__file__).resolve().parent / "assets",
+    def on_defaults(self) -> None:
+        if self._busy:
+            return
+        if not messagebox.askyesno(
+            "Default settings",
+            "Reset options and identification methods to defaults?\n"
+            "Paths (Source / Output / DATs) are kept.\n\n"
+            f"This updates {CONFIG_PATH.name}.",
+            parent=self,
         ):
-            p = base / name
-            if p.is_file():
-                return p
-        return None
+            return
+        # Keep current paths
+        src = self.var_source.get().strip()
+        dst = self.var_dest.get().strip()
+        dat = self.var_dat.get().strip() or str(DEFAULT_DATS)
+        self.settings = Settings(
+            source_path=src or Settings().source_path,
+            destination_path=dst or Settings().destination_path,
+            dat_path=dat,
+        )
+        save_settings(self.settings)
+        self._load_into_form()
+        self.log_line("Settings reset to defaults (paths kept)")
+
+    def on_pause(self) -> None:
+        if not self._busy:
+            return
+        if self._paused:
+            self._paused = False
+            self._pause.clear()
+            self.btn_pause.configure(text="Pause")
+            self._emit("log", "Resumed")
+            cur = float(self.progress_op["value"]) / 100.0 if not self._progress_indeterminate else 0.0
+            ov = float(self.progress_all["value"]) / 100.0
+            self._emit_progress("Processing…", cur, "resumed", overall=ov)
+        else:
+            self._paused = True
+            self._pause.set()
+            self.btn_pause.configure(text="Resume")
+            self._emit("log", "Paused")
+            cur = float(self.progress_op["value"]) / 100.0 if not self._progress_indeterminate else 0.0
+            ov = float(self.progress_all["value"]) / 100.0
+            self._emit_progress("Paused", cur, "waiting…", overall=ov)
+
+    def on_stop(self) -> None:
+        if not self._busy:
+            return
+        self._stop.set()
+        self._pause.clear()
+        self._paused = False
+        self.btn_pause.configure(text="Pause", state=tk.DISABLED)
+        self.btn_stop.configure(state=tk.DISABLED)
+        self._emit("log", "Stop requested…")
+
+    def on_dat_manager(self) -> None:
+        if self._busy:
+            return
+        self.settings = self._form_to_settings()
+        dat = Path(self.settings.dat_path.strip() or DEFAULT_DATS)
+
+        def on_saved(path: Path, _prefs) -> None:
+            self.var_dat.set(str(path))
+            self.settings = self._form_to_settings()
+            save_settings(self.settings)
+            self.log_line(f"DAT prefs saved: {path}")
+
+        DatManagerDialog(
+            self,
+            dat,
+            recursive=bool(self.settings.dat_recursive),
+            on_saved=on_saved,
+        )
 
     def on_about(self) -> None:
         dlg = tk.Toplevel(self)
@@ -2808,14 +3038,15 @@ class App(tk.Tk):
 
         credits = (
             "Acknowledgments\n"
-            "• MiSTer Organize — path DAT packs for MiSTer layouts\n"
-            "• No-Intro — console ROM DAT standards\n"
-            "• Redump — optical disc dump DAT standards\n"
-            "• libretro-database — public No-Intro / Redump mirror\n"
-            "• MiSTer FPGA community; icon: MiSTer-kun / MkDocs_MiSTer\n"
+            "- MiSTer Organize - path DAT packs for MiSTer layouts\n"
+            "- No-Intro - console ROM DAT standards\n"
+            "- Redump - optical disc dump DAT standards\n"
+            "- libretro-database - public No-Intro / Redump mirror\n"
+            "- MiSTer FPGA community; icon: MiSTer-kun / MkDocs_MiSTer\n"
             "\n"
             "License: MIT"
         )
+
         ttk.Label(frame, text=credits, justify=tk.LEFT).pack(anchor=tk.W, pady=(12, 10))
 
         donate_row = ttk.Frame(frame)
@@ -2857,82 +3088,11 @@ class App(tk.Tk):
         y = self.winfo_rooty() + max(40, (self.winfo_height() - dlg.winfo_height()) // 3)
         dlg.geometry(f"+{x}+{y}")
 
-    def on_defaults(self) -> None:
-        if self._busy:
-            return
-        if not messagebox.askyesno(
-            "Default settings",
-            "Reset options and identification methods to defaults?\n"
-            "Paths (Source / Output / DATs) are kept.\n\n"
-            f"This updates {CONFIG_PATH.name}.",
-            parent=self,
-        ):
-            return
-        # Keep current paths (may be empty)
-        src = self.var_source.get().strip()
-        dst = self.var_dest.get().strip()
-        dat = self.var_dat.get().strip()
-        self.settings = Settings(
-            source_path=src,
-            destination_path=dst,
-            dat_path=dat,
-        )
-        save_settings(self.settings)
-        self._load_into_form()
-        self.log_line("Settings reset to defaults (paths kept)")
-
-    def on_pause(self) -> None:
-        if not self._busy:
-            return
-        if self._paused:
-            self._paused = False
-            self._pause.clear()
-            self.btn_pause.configure(text="Pause")
-            self._emit("log", "Resumed")
-            self._emit("progress", ("Processing…", self.progress["value"] / 100.0, "resumed"))
-        else:
-            self._paused = True
-            self._pause.set()
-            self.btn_pause.configure(text="Resume")
-            self._emit("log", "Paused")
-            self._emit("progress", ("Paused", self.progress["value"] / 100.0, "waiting…"))
-
-    def on_stop(self) -> None:
-        if not self._busy:
-            return
-        self._stop.set()
-        self._pause.clear()
-        self._paused = False
-        self.btn_pause.configure(text="Pause", state=tk.DISABLED)
-        self.btn_stop.configure(state=tk.DISABLED)
-        self._emit("log", "Stop requested…")
-
-    def on_dat_manager(self) -> None:
-        if self._busy:
-            return
-        self.settings = self._form_to_settings()
-        dat = _resolve_dat_dir(self.settings.dat_path)
-        ensure_default_dat_layout(dat)
-
-        def on_saved(path: Path, _prefs) -> None:
-            self.var_dat.set(str(path))
-            self.settings = self._form_to_settings()
-            save_settings(self.settings)
-            self.log_line(f"DAT prefs saved: {path}")
-
-        DatManagerDialog(
-            self,
-            dat,
-            recursive=bool(self.settings.dat_recursive),
-            on_saved=on_saved,
-        )
-
-    def on_download(self, *, then_scan: bool = False) -> None:
+    def on_download(self) -> None:
         if self._busy:
             return
         self.settings = self._form_to_settings()
         save_settings(self.settings)
-        self._pending_scan_after_dat = bool(then_scan)
         self._reset_control()
         self._set_busy(True)
         self.log_line("Updating DATs: MiSTer Organize + No-Intro/Redump…")
@@ -3154,50 +3314,16 @@ class App(tk.Tk):
             return
         self.settings = self._form_to_settings()
         save_settings(self.settings)
-        if not self.settings.source_path.strip():
-            messagebox.showerror(
-                "Error",
-                "Source path is empty.\nChoose a Source folder first.",
-                parent=self,
-            )
-            return
         src = Path(self.settings.source_path)
         if not src.exists():
-            messagebox.showerror("Error", f"Source folder not found:\n{src}", parent=self)
+            messagebox.showerror("Error", f"Source folder not found:\n{src}")
             return
-
-        dat_dir = _resolve_dat_dir(self.settings.dat_path)
-        ensure_default_dat_layout(dat_dir)
-        if "dat" in self.settings.methods:
-            dat_files = list_dat_files(
-                dat_dir, recursive=bool(self.settings.dat_recursive)
-            )
-            if not dat_files:
-                if messagebox.askyesno(
-                    "DAT files missing",
-                    "No DAT files found in:\n"
-                    f"{dat_dir}\n\n"
-                    "Update DAT files from the built-in online sources now?\n"
-                    "(MiSTer Organize + No-Intro / Redump via libretro-database)\n\n"
-                    "Scan will start automatically after the update.",
-                    parent=self,
-                ):
-                    self.on_download(then_scan=True)
-                    return
-                if not messagebox.askyesno(
-                    "Continue without DAT?",
-                    "Continue the scan without DAT matching?\n"
-                    "(extension / magic only)",
-                    parent=self,
-                ):
-                    return
-                # Drop DAT for this scan only
-                self.settings.methods = [
-                    m for m in self.settings.methods if m != "dat"
-                ]
-                if not self.settings.methods:
-                    self.settings.methods = ["extension", "magic"]
-
+        if "dat" in self.settings.methods and not Path(self.settings.dat_path).exists():
+            if not messagebox.askyesno(
+                "DATs Folder missing",
+                "DATs Folder not found. Continue without DAT matching?",
+            ):
+                return
         self._reset_control()
         self._clear_scan_results()
         self._set_busy(True)
@@ -3253,17 +3379,16 @@ class App(tk.Tk):
 
     def _worker_download(self) -> None:
         try:
-            dest = _resolve_dat_dir(self.settings.dat_path)
+            dest = Path(self.settings.dat_path) if self.settings.dat_path.strip() else DEFAULT_DATS
             old_hint = "MiSTer Organize\\DatRoot"
             if old_hint.casefold() in str(dest).replace("/", "\\").casefold():
                 dest = DEFAULT_DATS
-            ensure_default_dat_layout(dest)
             dest.mkdir(parents=True, exist_ok=True)
 
             def prog(stage: str, frac: float, detail: str) -> None:
                 self._check_control()
                 label = "Listing GitHub…" if stage == "list" else "Downloading / updating…"
-                self._emit("progress", (label, frac, detail))
+                self._emit_progress(label, frac, detail, overall=frac)
                 if detail:
                     self._emit("log", detail)
 
@@ -3276,7 +3401,7 @@ class App(tk.Tk):
             save_dat_prefs(path, prefs)
             self.settings.dat_path = str(path)
             save_settings(self.settings)
-            self._emit("progress", ("DAT update done", 1.0, str(path)))
+            self._emit_progress("DAT update done", 1.0, str(path), overall=1.0)
             for n in notes:
                 self._emit("log", f"  ! {n}")
             from dat_prefs import list_dat_files
@@ -3292,11 +3417,9 @@ class App(tk.Tk):
             self._emit("log", f"DAT update finished: +{downloaded} / skip {skipped}")
             self._emit("done", ("DAT update", msg))
         except InterruptedError:
-            self._pending_scan_after_dat = False
             self._emit("log", "DAT update stopped")
             self._emit("stopped", "DAT update was stopped.")
         except Exception as exc:
-            self._pending_scan_after_dat = False
             self._emit("log", f"ERROR: {exc}")
             self._emit("error", str(exc))
 
@@ -3304,12 +3427,8 @@ class App(tk.Tk):
         try:
             settings = self.settings
             src = Path(settings.source_path)
-            dst: Optional[Path] = (
-                Path(settings.destination_path)
-                if settings.destination_path.strip()
-                else None
-            )
-            dat = _resolve_dat_dir(settings.dat_path)
+            dst = Path(settings.destination_path)
+            dat = Path(settings.dat_path)
             methods = list(settings.methods)
 
             index: Optional[DatIndex] = None
@@ -3317,7 +3436,12 @@ class App(tk.Tk):
 
                 def dat_prog(stage: str, frac: float, detail: str) -> None:
                     self._check_control()
-                    self._emit("progress", ("Loading DAT…", frac, detail))
+                    self._emit_progress(
+                        "Loading DAT",
+                        frac,
+                        detail or "reading DAT…",
+                        overall=scan_overall("dat", frac),
+                    )
 
                 try:
                     prefs = merge_prefs_with_folder(
@@ -3349,62 +3473,227 @@ class App(tk.Tk):
                 f"CRC cache: {crc_cache.entry_count} entr(y/ies) "
                 f"({_ROOT / 'crc_cache.json'})",
             )
-            self._emit("progress", ("Listing source…", 0.0, str(src)))
-            files = self._list_files(src, recursive=bool(settings.source_recursive))
+
+            unc_src = is_unc_path(src)
+            list_tick = [0.0]
+
+            def on_list_src(n: int, p: Path) -> None:
+                # Unknown total → asymptotic bar so it moves with the file count
+                soft = min(0.97, 1.0 - 1.0 / (1.0 + n / 250.0))
+                now = time.monotonic()
+                if now - list_tick[0] < 0.15 and n % 100 != 0:
+                    return
+                list_tick[0] = now
+                try:
+                    rel = p.relative_to(src).as_posix()
+                except ValueError:
+                    rel = p.name
+                self._emit_progress(
+                    "Listing source",
+                    soft,
+                    f"found {n} · {rel}",
+                    overall=scan_overall("list_src", soft),
+                )
+
+            self._emit_progress(
+                "Listing source",
+                0.0,
+                str(src),
+                overall=scan_overall("list_src", 0.0),
+            )
+            sized = cast(
+                List[Tuple[Path, int]],
+                self._list_files(
+                    src,
+                    recursive=bool(settings.source_recursive),
+                    on_progress=on_list_src,
+                    with_sizes=True,
+                ),
+            )
+            files = [p for p, _ in sized]
+            self._emit_progress(
+                "Listing source",
+                1.0,
+                f"{len(files)} files",
+                overall=scan_overall("list_src", 1.0),
+            )
             self._emit(
                 "log",
                 f"Source files: {len(files)}"
                 f"{'' if settings.source_recursive else ' (top level only)'}",
             )
 
-            # Parallel identify
+            # Parallel identify: full worker pool; large files serialized (1 CRC at a time)
             scan_workers = worker_count(src, "scan")
-            self._emit("log", f"Identify workers: {scan_workers}")
             folders: Dict[str, FolderPlan] = {}
             skipped = 0
             done = 0
-            total = max(len(files), 1)
+            done_bytes = 0
             lock = threading.Lock()
+            in_flight: Dict[str, float] = {}  # name -> start monotonic
+            large_gate = threading.Semaphore(1)
 
-            def identify_one(path: Path) -> List[PlannedItem]:
+            # Small files first so the pool stays busy; large ISO/CHD one-by-one via gate
+            sized.sort(key=lambda t: (t[1] >= LARGE_FILE_BYTES, t[1]))
+            total = max(len(sized), 1)
+            total_bytes = max(sum(sz for _, sz in sized), 1)
+            n_large = sum(1 for _, sz in sized if sz >= LARGE_FILE_BYTES)
+            self._emit(
+                "log",
+                f"Identify workers: {scan_workers}"
+                f"{' (UNC/SMB)' if unc_src else ''}"
+                + (
+                    f"; large files (≥{LARGE_FILE_BYTES // (1024 * 1024)} MB): "
+                    f"{n_large} — serial CRC"
+                    if n_large
+                    else ""
+                ),
+            )
+
+            def identify_one(path: Path, size: int) -> List[PlannedItem]:
                 self._check_control()
-                return plan_source(
-                    path,
-                    methods,
-                    index,
-                    settings.unknown_mode,
-                    skip_bios=settings.skip_bios,
-                    primary_only=settings.primary_only,
-                )
+                name = path.name
+                t0 = time.monotonic()
+                is_large = size >= LARGE_FILE_BYTES
+                if is_large:
+                    large_gate.acquire()
+                with lock:
+                    in_flight[name] = t0
 
-            with ThreadPoolExecutor(max_workers=scan_workers) as pool:
-                futs = {pool.submit(identify_one, p): p for p in files}
-                for fut in as_completed(futs):
+                def hash_prog(stage: str, frac: float, detail: str) -> None:
                     self._check_control()
-                    done += 1
-                    if done % 20 == 0 or done == total:
-                        self._emit(
-                            "progress",
-                            ("Identifying…", done / total, f"{done}/{total}"),
+                    mb = max(size, 1) / (1024 * 1024)
+                    done_mb = frac * mb
+                    # Current bar = files progress (done + this file's CRC fraction)
+                    files_frac = min(1.0, (done + max(0.0, frac)) / total)
+                    if stage == "hash_stall":
+                        msg = (
+                            f"{done}/{total} · {name} SMB stalled "
+                            f"at {done_mb:.0f}/{mb:.0f} MB"
                         )
-                    try:
-                        planned = fut.result()
-                    except InterruptedError:
-                        raise
-                    except Exception as exc:
-                        self._emit("log", f"identify fail: {futs[fut].name}: {exc}")
-                        skipped += 1
-                        continue
-                    if not planned:
-                        skipped += 1
-                        continue
+                    else:
+                        tag = "CRC serial" if is_large else "CRC"
+                        msg = (
+                            f"{done}/{total} · {name} · {tag} "
+                            f"{done_mb:.0f}/{mb:.0f} MB"
+                        )
+                    overall = scan_overall(
+                        "identify",
+                        min(
+                            1.0,
+                            (done_bytes + size * max(0.0, frac)) / total_bytes,
+                        ),
+                    )
+                    self._emit_progress(
+                        "Identifying",
+                        files_frac,
+                        msg,
+                        overall=overall,
+                    )
+
+                try:
+                    return plan_source(
+                        path,
+                        methods,
+                        index,
+                        settings.unknown_mode,
+                        skip_bios=settings.skip_bios,
+                        primary_only=settings.primary_only,
+                        progress=hash_prog,
+                    )
+                finally:
+                    elapsed = time.monotonic() - t0
                     with lock:
-                        for item in planned:
-                            plan = folders.get(item.folder)
-                            if plan is None:
-                                plan = FolderPlan(name=item.folder)
-                                folders[item.folder] = plan
-                            plan.items.append(item)
+                        in_flight.pop(name, None)
+                    if is_large:
+                        large_gate.release()
+                    if elapsed >= 20.0:
+                        self._emit(
+                            "log",
+                            f"Slow identify ({elapsed:.0f}s, {size // (1024 * 1024)} MB): {name}",
+                        )
+
+            def _identify_detail() -> str:
+                with lock:
+                    live = list(in_flight.keys())[:2]
+                live_s = f" · {', '.join(live)}" if live else ""
+                return f"{done}/{total} files · {done_bytes // (1024 * 1024)} MB done{live_s}"
+
+            # Sliding window; at most one large file in flight so workers aren't stuck on the gate
+            window = max(scan_workers * 2, scan_workers + 1)
+            pending = list(sized)
+            with ThreadPoolExecutor(max_workers=scan_workers) as pool:
+                futs: Dict[Any, Tuple[Path, int]] = {}
+
+                def _submit_more() -> None:
+                    while pending and len(futs) < window:
+                        large_inflight = any(
+                            sz >= LARGE_FILE_BYTES for _, sz in futs.values()
+                        )
+                        pick_i = None
+                        for i, (_p, sz) in enumerate(pending):
+                            if sz >= LARGE_FILE_BYTES and large_inflight:
+                                continue
+                            pick_i = i
+                            break
+                        if pick_i is None:
+                            break
+                        path, size = pending.pop(pick_i)
+                        futs[pool.submit(identify_one, path, size)] = (path, size)
+
+                _submit_more()
+                while futs:
+                    self._check_control()
+                    finished, _ = wait(
+                        tuple(futs.keys()),
+                        timeout=0.6,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not finished:
+                        files_frac = done / total
+                        self._emit_progress(
+                            "Identifying",
+                            files_frac,
+                            _identify_detail() + " (waiting on SMB/IO…)",
+                            overall=scan_overall(
+                                "identify", done_bytes / total_bytes
+                            ),
+                        )
+                        continue
+                    for fut in finished:
+                        path, size = futs.pop(fut)
+                        done += 1
+                        done_bytes += size
+                        every = 1 if unc_src else 5
+                        if done % every == 0 or done == total or not futs:
+                            files_frac = done / total
+                            self._emit_progress(
+                                "Identifying",
+                                files_frac,
+                                _identify_detail(),
+                                overall=scan_overall(
+                                    "identify", done_bytes / total_bytes
+                                ),
+                            )
+                        try:
+                            planned = fut.result()
+                        except InterruptedError:
+                            raise
+                        except Exception as exc:
+                            self._emit("log", f"identify fail: {path.name}: {exc}")
+                            skipped += 1
+                            continue
+                        if not planned:
+                            skipped += 1
+                            continue
+                        with lock:
+                            for item in planned:
+                                plan = folders.get(item.folder)
+                                if plan is None:
+                                    plan = FolderPlan(name=item.folder)
+                                    folders[item.folder] = plan
+                                plan.items.append(item)
+                    _submit_more()
 
             # CD cue-sets: align orphan .cue/.bin paths to best DAT game folder
             all_items = [it for f in folders.values() for it in f.items]
@@ -3445,107 +3734,236 @@ class App(tk.Tk):
 
             def crc_job(group: List[PlannedItem]) -> None:
                 self._check_control()
-                if group[0].is_archive:
-                    _fill_zip_group_crcs(group)
-                else:
-                    _fill_loose_item_crc(group[0])
+                it0 = group[0]
+                sz = int(it0.packed_bytes or it0.unpacked_bytes or 0)
+                gate = sz >= LARGE_FILE_BYTES
+                if gate:
+                    large_gate.acquire()
+                try:
+                    if it0.is_archive:
+                        _fill_zip_group_crcs(group)
+                    else:
+                        _fill_loose_item_crc(it0)
+                finally:
+                    if gate:
+                        large_gate.release()
 
             with ThreadPoolExecutor(max_workers=scan_workers) as pool:
                 futs = [pool.submit(crc_job, g) for g in crc_jobs]
                 for fut in as_completed(futs):
                     self._check_control()
                     done += 1
-                    if done % 20 == 0 or done == total:
-                        self._emit(
-                            "progress",
-                            ("Source CRC…", done / total, f"{done}/{total}"),
+                    if done % 5 == 0 or done == total:
+                        frac = done / total
+                        self._emit_progress(
+                            "Source CRC",
+                            frac,
+                            f"{done}/{total} jobs",
+                            overall=scan_overall("src_crc", frac),
                         )
                     fut.result()
 
-            # Destination scan: list candidates by size/path, then CRC only those
+            # Destination: list ALL of Output (cheap size/name/path), CRC only hits
             by_rel: Dict[str, DestEntry] = {}
             by_crc: Dict[str, List[DestEntry]] = {}
-            if dst is not None and dst.exists():
-                needed_sizes = set()
-                needed_rels = set()
-                folder_names = set(folders.keys())
+            if dst.exists():
+                needed_sizes: set = set()
+                needed_rels: set = set()
+                needed_names: set = set()
                 for it in all_items:
-                    needed_sizes.add(it.packed_bytes)
-                    needed_sizes.add(it.unpacked_bytes)
-                    needed_rels.add(it.rel_packed.replace("\\", "/").casefold())
-                    needed_rels.add(it.rel_unpacked.replace("\\", "/").casefold())
+                    needed_sizes.add(int(it.packed_bytes or 0))
+                    needed_sizes.add(int(it.unpacked_bytes or 0))
+                    needed_sizes.discard(0)
+                    for rel in (it.rel_packed, it.rel_unpacked):
+                        r = rel.replace("\\", "/").strip("/")
+                        if not r:
+                            continue
+                        needed_rels.add(r.casefold())
+                        needed_names.add(Path(r).name.casefold())
+                    needed_names.add(it.source.name.casefold())
+                    if it.zip_member:
+                        needed_names.add(Path(it.zip_member).name.casefold())
 
-                self._emit("progress", ("Listing MiSTer…", 0.0, str(dst)))
-                dest_candidates: List[Tuple[str, Path, int]] = []
-                # Prefer scanning only planned top-level folders
-                roots = []
-                for name in folder_names:
-                    p = dst / name
-                    if p.is_dir():
-                        roots.append(p)
-                if not roots and dst.is_dir():
-                    roots = [dst]
+                def _cheap_dest_hit(rel: str, size: int) -> bool:
+                    """Size / basename / exact rel — no file read."""
+                    if size and size in needed_sizes:
+                        return True
+                    rf = rel.casefold()
+                    if rf in needed_rels:
+                        return True
+                    return Path(rel).name.casefold() in needed_names
 
+                known_src_crc = build_known_source_crcs(all_items)
+                same_tree = paths_same_tree(src, dst)
                 dest_recursive = bool(settings.dest_recursive)
-                for root in roots:
-                    self._check_control()
-                    for p in self._list_files(root, recursive=dest_recursive):
+                # Source is the whole Output tree (or identical recurse) → reuse list
+                reuse_listing = same_tree and (
+                    bool(settings.source_recursive) == dest_recursive
+                )
+
+                self._emit_progress(
+                    "Listing MiSTer",
+                    0.0,
+                    str(dst),
+                    overall=scan_overall("dest", 0.0),
+                )
+                dest_candidates: List[Tuple[str, Path, int]] = []
+                listed_n = 0
+
+                if reuse_listing:
+                    self._emit(
+                        "log",
+                        "Source = Output: reusing source file list for MiSTer match",
+                    )
+                    size_by_src = {
+                        _norm_path_key(it.source): int(it.packed_bytes or 0)
+                        for it in all_items
+                        if it.packed_bytes
+                    }
+                    for p in files:
+                        self._check_control()
+                        listed_n += 1
+                        try:
+                            rel = p.relative_to(dst).as_posix()
+                            size = size_by_src.get(_norm_path_key(p))
+                            if size is None:
+                                size = p.stat().st_size
+                        except (OSError, ValueError):
+                            continue
+                        if _cheap_dest_hit(rel, size):
+                            dest_candidates.append((rel, p, size))
+                        if listed_n % 100 == 0:
+                            self._emit_progress(
+                                "Listing MiSTer",
+                                listed_n / max(len(files), 1),
+                                f"listed {listed_n}/{len(files)} · "
+                                f"cheap hits {len(dest_candidates)}",
+                                overall=scan_overall(
+                                    "dest",
+                                    0.15 * listed_n / max(len(files), 1),
+                                ),
+                            )
+                else:
+                    # Full Output tree (all cores), not only planned folders
+                    self._emit(
+                        "log",
+                        "MiSTer match: list all Output, CRC only cheap hits "
+                        "(size / name / planned path)",
+                    )
+
+                    def on_list_dst(n: int, p: Path) -> None:
+                        try:
+                            rel = p.relative_to(dst).as_posix()
+                        except ValueError:
+                            rel = p.name
+                        soft = min(0.97, 1.0 - 1.0 / (1.0 + n / 250.0))
+                        self._emit_progress(
+                            "Listing MiSTer",
+                            soft,
+                            f"listed {n} · {rel}",
+                            overall=scan_overall("dest", min(0.2, soft)),
+                        )
+
+                    listed = cast(
+                        List[Tuple[Path, int]],
+                        self._list_files(
+                            dst,
+                            recursive=dest_recursive,
+                            on_progress=on_list_dst,
+                            with_sizes=True,
+                        ),
+                    )
+                    listed_n = len(listed)
+                    for i, (p, size) in enumerate(listed, 1):
                         self._check_control()
                         try:
-                            if p.name.startswith("."):
-                                continue
                             rel = p.relative_to(dst).as_posix()
-                            size = p.stat().st_size
-                        except OSError:
+                        except ValueError:
                             continue
-                        if rel.casefold() in needed_rels or size in needed_sizes:
+                        if _cheap_dest_hit(rel, size):
                             dest_candidates.append((rel, p, size))
+                        if i % 200 == 0 or i == listed_n:
+                            self._emit_progress(
+                                "Listing MiSTer",
+                                i / max(listed_n, 1),
+                                f"cheap filter {i}/{listed_n} · "
+                                f"hits {len(dest_candidates)}",
+                                overall=scan_overall(
+                                    "dest", 0.2 + 0.05 * i / max(listed_n, 1)
+                                ),
+                            )
+
+                reused = 0
+                to_hash: List[Tuple[str, Path, int]] = []
+                for rel, path, size in dest_candidates:
+                    hit = known_src_crc.get(_norm_path_key(path))
+                    if hit and hit[0]:
+                        entry = DestEntry(
+                            rel=rel, path=path, size=hit[1] or size, crc=hit[0]
+                        )
+                        by_rel[entry.rel.casefold()] = entry
+                        by_crc.setdefault(entry.crc, []).append(entry)
+                        reused += 1
+                    else:
+                        to_hash.append((rel, path, size))
 
                 self._emit(
                     "log",
-                    f"MiSTer candidates to CRC: {len(dest_candidates)} "
-                    f"(size/path filtered"
-                    f"{'' if dest_recursive else ', top level per core'}"
-                    f")",
+                    f"MiSTer: listed {listed_n} file(s), cheap hits "
+                    f"{len(dest_candidates)} → CRC {len(to_hash)} "
+                    f"(reuse {reused} source CRC"
+                    f"{'' if dest_recursive else ', top level only'}"
+                    f"{', same tree' if same_tree else ''})",
                 )
                 dest_workers = worker_count(dst, "scan")
                 done = 0
-                total = max(len(dest_candidates), 1)
+                total = max(len(to_hash), 1)
 
                 def hash_dest(rel: str, path: Path, size: int) -> Optional[DestEntry]:
                     self._check_control()
+                    gate = size >= LARGE_FILE_BYTES
+                    if gate:
+                        large_gate.acquire()
                     try:
                         crc, got = file_crc32(path)
                         return DestEntry(rel=rel, path=path, size=got or size, crc=crc)
                     except OSError:
                         return None
+                    finally:
+                        if gate:
+                            large_gate.release()
 
-                with ThreadPoolExecutor(max_workers=dest_workers) as pool:
-                    futs = [
-                        pool.submit(hash_dest, rel, path, size)
-                        for rel, path, size in dest_candidates
-                    ]
-                    for fut in as_completed(futs):
-                        self._check_control()
-                        done += 1
-                        if done % 20 == 0 or done == total:
-                            self._emit(
-                                "progress",
-                                ("MiSTer CRC…", done / total, f"{done}/{total}"),
-                            )
-                        entry = fut.result()
-                        if entry is None:
-                            continue
-                        by_rel[entry.rel.casefold()] = entry
-                        by_crc.setdefault(entry.crc, []).append(entry)
-            else:
-                if dst is None:
-                    self._emit("log", "Output path empty — skipping MiSTer status scan")
+                if to_hash:
+                    with ThreadPoolExecutor(max_workers=dest_workers) as pool:
+                        futs = [
+                            pool.submit(hash_dest, rel, path, size)
+                            for rel, path, size in to_hash
+                        ]
+                        for fut in as_completed(futs):
+                            self._check_control()
+                            done += 1
+                            if done % 5 == 0 or done == total:
+                                frac = done / total
+                                self._emit_progress(
+                                    "MiSTer CRC",
+                                    frac,
+                                    f"{done}/{total} candidates",
+                                    overall=scan_overall("dest", 0.25 + 0.75 * frac),
+                                )
+                            entry = fut.result()
+                            if entry is None:
+                                continue
+                            by_rel[entry.rel.casefold()] = entry
+                            by_crc.setdefault(entry.crc, []).append(entry)
                 else:
-                    self._emit(
-                        "log",
-                        f"MiSTer path missing (OK for first fill): {dst}",
+                    self._emit_progress(
+                        "MiSTer CRC",
+                        1.0,
+                        "reused source CRCs",
+                        overall=scan_overall("dest", 1.0),
                     )
+            else:
+                self._emit("log", f"MiSTer path missing (OK for first fill): {dst}")
 
             apply_dest_matches(folders, by_rel, by_crc)
             if settings.skip_bios:
@@ -3561,7 +3979,12 @@ class App(tk.Tk):
                         f"BIOS/boot ROMs: Transfer off for {bios_off} item(s)",
                     )
             get_crc_cache().save(force=True)
-            self._emit("progress", ("Scan done", 1.0, f"{len(folders)} folders"))
+            self._emit_progress(
+                "Scan done",
+                1.0,
+                f"{len(folders)} folders",
+                overall=1.0,
+            )
             self._emit("log", f"Skipped (not planned): {skipped}")
             self._emit("scan_done", (folders, by_rel, by_crc))
         except InterruptedError:
@@ -3660,13 +4083,12 @@ class App(tk.Tk):
                         unit = futs[fut]
                         done_items += len(unit)
                         if done_items % 5 == 0 or done_items >= total:
-                            self._emit(
-                                "progress",
-                                (
-                                    "Transferring…",
-                                    min(done_items, total) / total,
-                                    f"{min(done_items, total)}/{total}",
-                                ),
+                            frac = min(done_items, total) / total
+                            self._emit_progress(
+                                "Transferring…",
+                                frac,
+                                f"{min(done_items, total)}/{total}",
+                                overall=frac,
                             )
                         fut.result()
             except InterruptedError:
@@ -3703,10 +4125,11 @@ class App(tk.Tk):
             )
             self._emit("log", summary.replace("\n", " | "))
             if stopped_early:
-                self._emit("progress", ("Stopped", self.progress["value"] / 100.0, ""))
+                cur = float(self.progress_op["value"]) / 100.0
+                self._emit_progress("Stopped", cur, "", overall=cur)
                 self._emit("stopped", "Transfer stopped.\n\n" + summary)
             else:
-                self._emit("progress", ("Done", 1.0, ""))
+                self._emit_progress("Done", 1.0, "", overall=1.0)
                 self._emit("done", ("Transfer finished", summary))
         except InterruptedError:
             self._emit("log", "Transfer stopped")

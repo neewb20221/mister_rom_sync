@@ -1,7 +1,7 @@
 {
-  "source_path": "",
-  "destination_path": "",
-  "dat_path": "",
+  "source_path": "C:\\path\\to\\rom_collection",
+  "destination_path": "\\\\MISTER\\sdcard\\games",
+  "dat_path": "dats",
   "methods": ["dat", "extension", "magic"],
   "method_order": ["dat", "extension", "magic"],
   "source_recursive": true,

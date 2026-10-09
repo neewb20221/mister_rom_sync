@@ -14,7 +14,10 @@ REM   3) Commit and push to origin
 set "VER=%~1"
 if "%VER%"=="" set "VER=0.1.0"
 
+set "ZIP=MiSTerRomSync-%VER%-windows.zip"
+
 echo Version: %VER%
+echo Zip: %ZIP%
 echo.
 
 call build_exe.bat
@@ -26,8 +29,22 @@ if not exist "MiSTerRomSync.exe" (
 )
 
 echo.
+echo Packing Windows build into %ZIP% ...
+if exist "%ZIP%" del /f /q "%ZIP%"
+powershell -NoProfile -Command ^
+  "Compress-Archive -LiteralPath 'MiSTerRomSync.exe' -DestinationPath '%ZIP%' -Force"
+if errorlevel 1 (
+  echo ERROR: failed to create %ZIP%
+  exit /b 1
+)
+if not exist "%ZIP%" (
+  echo ERROR: %ZIP% not found after pack.
+  exit /b 1
+)
+
+echo.
 echo Creating GitHub release v%VER% ...
-gh release create "v%VER%" "MiSTerRomSync.exe" ^
+gh release create "v%VER%" "%ZIP%" ^
   --title "MiSTer ROM Sync %VER%" ^
   --notes-file CHANGELOG.md ^
   --latest
