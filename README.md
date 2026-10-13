@@ -1,5 +1,7 @@
 ﻿# MiSTer ROM Sync
 
+<img width="900" alt="MiSTer ROM Sync" src="assets/screenshot.png" />
+
 Windows app to identify ROMs (DAT CRC / extension / headers), plan paths for MiSTer `games/`, and copy files to your MiSTer library.
 
 **Current version:** [0.2.0](https://github.com/neewb20221/mister_rom_sync/releases/tag/v0.2.0)
